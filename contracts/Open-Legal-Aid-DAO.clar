@@ -16,6 +16,9 @@
 (define-constant err-voting-period-ended (err u108))
 (define-constant err-case-not-funded (err u109))
 (define-constant err-payment-already-made (err u110))
+(define-constant err-milestone-not-found (err u111))
+(define-constant err-milestone-already-completed (err u112))
+(define-constant err-invalid-milestone (err u113))
 
 (define-constant min-donation u1000000)
 (define-constant voting-period u144)
@@ -24,6 +27,7 @@
 (define-data-var next-case-id uint u1)
 (define-data-var total-donations uint u0)
 (define-data-var dao-treasury uint u0)
+(define-data-var next-milestone-id uint u1)
 
 (define-map cases uint {
   title: (string-ascii 100),
@@ -47,6 +51,20 @@
   cases-handled: uint,
   reputation-score: uint
 })
+
+(define-map milestones uint {
+  case-id: uint,
+  description: (string-ascii 200),
+  amount: uint,
+  votes-for: uint,
+  votes-against: uint,
+  status: (string-ascii 20),
+  created-at: uint,
+  completed-at: (optional uint)
+})
+
+(define-map milestone-voters {milestone-id: uint, voter: principal} bool)
+(define-map case-milestones {case-id: uint, milestone-index: uint} uint)
 
 (define-public (donate (amount uint))
   (begin
@@ -230,5 +248,102 @@
       is-active: false
     }
   )
+)
+
+(define-public (create-milestone (case-id uint) (description (string-ascii 200)) (amount uint) (milestone-index uint))
+  (let ((milestone-id (var-get next-milestone-id))
+        (case-data (unwrap! (map-get? cases case-id) err-not-found)))
+    (begin
+      (asserts! (is-eq tx-sender (get submitter case-data)) err-not-authorized)
+      (asserts! (is-eq (get status case-data) "approved") err-case-not-active)
+      (asserts! (> amount u0) err-invalid-amount)
+      (asserts! (<= amount (get requested-amount case-data)) err-invalid-amount)
+      (map-set milestones milestone-id {
+        case-id: case-id,
+        description: description,
+        amount: amount,
+        votes-for: u0,
+        votes-against: u0,
+        status: "pending",
+        created-at: stacks-block-height,
+        completed-at: none
+      })
+      (map-set case-milestones {case-id: case-id, milestone-index: milestone-index} milestone-id)
+      (var-set next-milestone-id (+ milestone-id u1))
+      (ok milestone-id)
+    )
+  )
+)
+
+(define-public (vote-on-milestone (milestone-id uint) (vote-for bool))
+  (let ((milestone-data (unwrap! (map-get? milestones milestone-id) err-milestone-not-found))
+        (voter-key {milestone-id: milestone-id, voter: tx-sender}))
+    (begin
+      (asserts! (is-eq (get status milestone-data) "pending") err-milestone-already-completed)
+      (asserts! (is-none (map-get? milestone-voters voter-key)) err-already-voted)
+      (asserts! (> (default-to u0 (map-get? donor-contributions tx-sender)) u0) err-not-authorized)
+      (map-set milestone-voters voter-key true)
+      (map-set milestones milestone-id
+        (merge milestone-data {
+          votes-for: (if vote-for (+ (get votes-for milestone-data) u1) (get votes-for milestone-data)),
+          votes-against: (if vote-for (get votes-against milestone-data) (+ (get votes-against milestone-data) u1))
+        }))
+      (ok true)
+    )
+  )
+)
+
+(define-public (finalize-milestone (milestone-id uint))
+  (let ((milestone-data (unwrap! (map-get? milestones milestone-id) err-milestone-not-found))
+        (case-data (unwrap! (map-get? cases (get case-id milestone-data)) err-not-found)))
+    (begin
+      (asserts! (is-eq (get status milestone-data) "pending") err-milestone-already-completed)
+      (asserts! (>= (+ (get votes-for milestone-data) (get votes-against milestone-data)) quorum-threshold) err-insufficient-funds)
+      (if (> (get votes-for milestone-data) (get votes-against milestone-data))
+        (begin
+          (map-set milestones milestone-id (merge milestone-data {
+            status: "approved",
+            completed-at: (some stacks-block-height)
+          }))
+          (ok "approved")
+        )
+        (begin
+          (map-set milestones milestone-id (merge milestone-data {status: "rejected"}))
+          (ok "rejected")
+        )
+      )
+    )
+  )
+)
+
+(define-public (release-milestone-payment (milestone-id uint))
+  (let ((milestone-data (unwrap! (map-get? milestones milestone-id) err-milestone-not-found))
+        (case-data (unwrap! (map-get? cases (get case-id milestone-data)) err-not-found)))
+    (begin
+      (asserts! (is-eq (get status milestone-data) "approved") err-milestone-not-found)
+      (asserts! (or (is-eq tx-sender (get submitter case-data))
+                   (is-eq tx-sender contract-owner)) err-not-authorized)
+      (try! (as-contract (stx-transfer? (get amount milestone-data)
+                                      tx-sender
+                                      (get lawyer-address case-data))))
+      (var-set dao-treasury (- (var-get dao-treasury) (get amount milestone-data)))
+      (map-set milestones milestone-id (merge milestone-data {
+        status: "completed"
+      }))
+      (ok (get amount milestone-data))
+    )
+  )
+)
+
+(define-read-only (get-milestone (milestone-id uint))
+  (map-get? milestones milestone-id)
+)
+
+(define-read-only (get-case-milestone (case-id uint) (milestone-index uint))
+  (map-get? case-milestones {case-id: case-id, milestone-index: milestone-index})
+)
+
+(define-read-only (has-voted-on-milestone (milestone-id uint) (voter principal))
+  (is-some (map-get? milestone-voters {milestone-id: milestone-id, voter: voter}))
 )
 
