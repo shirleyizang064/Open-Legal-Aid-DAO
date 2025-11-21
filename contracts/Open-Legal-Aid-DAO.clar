@@ -347,3 +347,15 @@
   (is-some (map-get? milestone-voters {milestone-id: milestone-id, voter: voter}))
 )
 
+(define-public (update-case-lawyer (case-id uint) (new-lawyer principal))
+  (let ((case-data (unwrap! (map-get? cases case-id) err-not-found)))
+    (begin
+      (asserts! (or (is-eq tx-sender (get submitter case-data)) (is-eq tx-sender contract-owner)) err-not-authorized)
+      (asserts! (or (is-eq (get status case-data) "pending") (is-eq (get status case-data) "approved")) err-case-not-active)
+      (asserts! (not (get payment-made case-data)) err-payment-already-made)
+      (asserts! (is-some (map-get? lawyer-registrations new-lawyer)) err-not-found)
+      (map-set cases case-id (merge case-data { lawyer-address: new-lawyer }))
+      (ok true)
+    )
+  )
+)
